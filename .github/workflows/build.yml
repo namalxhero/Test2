@@ -1,0 +1,104 @@
+name: Build APK
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'version.txt'
+      - '**.md'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the version from the clock (always newer than the last build)
+        id: ver
+        run: |
+          set -e
+          # 1.<yymmdd>.<hhmm> (UTC). The number only ever grows, so it does not matter what version.txt says or how the repo was pushed.
+          NEW="1.$(date -u +%y%m%d).$(date -u +%H%M)"
+          CODE=$(( ($(date -u +%s) - 1735689600) / 60 ))   # minutes since 2025-01-01, fits in an Int for ~4000 years
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Version: $NEW (code $CODE)"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Use the signing key from GitHub Secrets (if set)
+        env:
+          KEYSTORE_B64: ${{ secrets.QMG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "QMG_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "Signing with the key from GitHub Secrets"
+          else
+            echo "No QMG_KEYSTORE_BASE64 secret set: signing with the key committed in the repo"
+          fi
+
+      - name: Install Android SDK parts
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build APK
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+          APP_CODE: ${{ steps.ver.outputs.code }}
+          QMG_STORE_PASSWORD: ${{ secrets.QMG_STORE_PASSWORD }}
+          QMG_KEY_ALIAS: ${{ secrets.QMG_KEY_ALIAS }}
+          QMG_KEY_PASSWORD: ${{ secrets.QMG_KEY_PASSWORD }}
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Name and check the APK
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          mkdir -p dist
+          ls -l app/build/outputs/apk/release/
+          cp app/build/outputs/apk/release/*.apk "dist/QmgStudio-v${VERSION}.apk"
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          BT="$SDK/build-tools/34.0.0"
+          "$BT/apksigner" verify --verbose --print-certs "dist/QmgStudio-v${VERSION}.apk"
+          "$BT/aapt2" dump badging "dist/QmgStudio-v${VERSION}.apk" > /tmp/badging.txt
+          head -3 /tmp/badging.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QmgStudio-apk
+          path: dist/*.apk
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -e
+          APK="dist/QmgStudio-v${VERSION}.apk"
+          # re-running the same version replaces the old release instead of failing
+          gh release delete "v${VERSION}" --cleanup-tag --yes > /dev/null 2>&1 || true
+          gh release create "v${VERSION}" "$APK" \
+            --target "$GITHUB_SHA" \
+            --title "Qmg Studio v${VERSION}" \
+            --generate-notes
+          echo "Release published: v${VERSION}"
